@@ -1,0 +1,197 @@
+# CircleCi config for UI deployment
+
+version: 2.1
+
+executors:
+  node-executor:
+    docker:
+      - image: cimg/node:20.4.0
+  base-executor:
+    docker:
+      - image: cimg/base:2025.04
+
+jobs:
+  build_ui:
+    executor: node-executor
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: install dependencies
+          command: npm install
+      - run:
+          name: export environment variables & bundle files
+          command: |
+            export S3_ASSETS_URL=https://assets.$APP_SERVICE_DOMAIN
+            if [ "$ENV" = "prod" ]; then
+              export API_URL=https://$API_SERVICE_DOMAIN
+            else
+              export API_URL=https://$ENV.$API_SERVICE_DOMAIN
+            fi
+
+            npm run build
+      - persist_to_workspace:
+          root: /home/circleci/project
+          paths:
+            - dist
+
+  deploy_to_aws:
+    executor: base-executor
+    resource_class: small
+    parameters:
+      cf-template:
+        type: string
+        default: "cloudformation/cf-template.yaml"
+    steps:
+      - checkout
+      - run:
+          name: download/configure the AWS CLI and SAM CLI
+          command: |
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+            aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+            aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+            aws configure set default.region $AWS_REGION
+            curl -Lo sam https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+            sudo unzip sam -d sam-installation
+            sudo ./sam-installation/install
+      - run:
+          name: create empty s3 bucket and CloudFront distribution using the SAM CLI
+          command: |
+            STACK_NAME=$PROJECT_PREFIX-ui-$ENV
+
+            if [ "$ENV" = "prod" ]; then
+              CLOUDFRONT_ALIAS="$APP_SERVICE_DOMAIN,www.$APP_SERVICE_DOMAIN"
+            else
+              CLOUDFRONT_ALIAS=$ENV.$APP_SERVICE_DOMAIN
+            fi
+
+            sam deploy --stack-name $STACK_NAME \
+              --no-fail-on-empty-changeset \
+              --parameter-overrides \
+                Env=$ENV \
+                CloudFrontAlias=$CLOUDFRONT_ALIAS \
+                ACMCertificateArn=$CF_ACM_CERTIFICATE_ARN \
+                Route53HostedZoneID=$ROUTE53_HOSTED_ZONE_ID \
+                ProjectPrefix=$PROJECT_PREFIX \
+                Password=$BASIC_AUTH_PASSWORD \
+              --capabilities CAPABILITY_IAM \
+              --template << parameters.cf-template >> --region $AWS_REGION
+
+            BUCKET_NAME=$(aws cloudformation describe-stacks --stack-name $STACK_NAME \
+              --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text)
+
+            echo "BUCKET_NAME=${BUCKET_NAME}" >> $BASH_ENV
+            # reference: https://support.circleci.com/hc/en-us/articles/10816400480411-How-to-pass-environment-variables-between-jobs
+          no_output_timeout: 30m
+      - attach_workspace:
+          at: /home/circleci/project
+      - run:
+          name: upload /dist to the s3 bucket
+          command: |
+            aws s3 sync /home/circleci/project/dist/ s3://$BUCKET_NAME
+            aws s3 cp /home/circleci/project/public/vite.svg s3://$BUCKET_NAME
+
+
+workflows:
+  build-and-deploy-dev:
+    jobs:
+      - build_ui:
+          context:
+            - global-context
+            - dev-context
+      - hold_deploy_dev:
+          type: approval
+          requires:
+            - build_ui
+      - deploy_to_aws:
+          context:
+            - global-context
+            - dev-context
+          requires:
+            - hold_deploy_dev
+
+  build-and-deploy-test:
+    jobs:
+      - build_ui:
+          context:
+            - global-context
+            - test-context
+      - hold_deploy_test:
+          type: approval
+          requires:
+            - build_ui
+      - deploy_to_aws:
+          context:
+            - global-context
+            - test-context
+          requires:
+            - hold_deploy_test
+
+  build-and-deploy-stage:
+    jobs:
+      - build_ui:
+          context:
+            - global-context
+            - stage-context
+          filters:
+            branches:
+              only:
+                - master
+                - develop
+                - /^hotfix\/[a-z\d\-]+/
+      - hold_deploy_stage:
+          type: approval
+          requires:
+            - build_ui
+          filters:
+            branches:
+              only:
+                - master
+                - develop
+                - /^hotfix\/[a-z\d\-]+/
+      - deploy_to_aws:
+          context:
+            - global-context
+            - stage-context
+          requires:
+            - hold_deploy_stage
+          filters:
+            branches:
+              only:
+                - master
+                - develop
+                - /^hotfix\/[a-z\d\-]+/
+
+  build-and-deploy-prod:
+    jobs:
+      - build_ui:
+          context:
+            - global-context
+            - prod-context
+          filters:
+            branches:
+              only:
+                - master
+                - /^hotfix\/[a-z\d\-]+/
+      - hold_deploy_prod:
+          type: approval
+          requires:
+            - build_ui
+          filters:
+            branches:
+              only:
+                - master
+                - /^hotfix\/[a-z\d\-]+/
+      - deploy_to_aws:
+          context:
+            - global-context
+            - prod-context
+          requires:
+            - hold_deploy_prod
+          filters:
+            branches:
+              only:
+                - master
+                - /^hotfix\/[a-z\d\-]+/

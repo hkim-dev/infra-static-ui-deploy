@@ -1,0 +1,166 @@
+# CloudFormation template for deploying S3 bucket and CloudFront distribution
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+
+Parameters:
+  Env:
+    Description: Environment in which the application will be deployed
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+      - stage
+    Type: String
+  ACMCertificateArn:
+    Description: ARN of the ACM certificate for the domain
+    Type: String
+  Route53HostedZoneID:
+    Description: Hosted zone IP of the project domain
+    Type: String
+  ProjectPrefix:
+    Description: project domain/prefix for the project
+    Type: String
+  CloudFrontAlias:
+    Description: environment specific alias for CloudFront distribution
+    Type: String
+
+Conditions:
+  CreateProdResources: !Equals
+    - !Ref Env
+    - prod
+  CreateNonProdResources: !Not
+    - Condition: CreateProdResources
+
+Resources:
+
+  #######################################################################
+  ######################### S3 bucket resources #########################
+  #######################################################################
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectPrefix}-s3-${Env}
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Sub ${ProjectPrefix}-logs-${Env}
+        LogFilePrefix: access-logs/
+
+  # s3 bucket policy to allow access from CloudFront
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn:
+      - FrontendBucket
+      - CloudFrontOriginAccessIdentity
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: 's3:GetObject'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}'
+            Resource: !Join ['', ['arn:aws:s3:::', !Ref FrontendBucket, '/*']]
+
+  #######################################################################
+  ######################## CloudFront resources #########################
+  #######################################################################
+
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub CloudFront OAI for ${ProjectPrefix}-${Env}
+
+  CachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Comment: !Sub cache policy for ${ProjectPrefix}
+        Name: !Sub ${ProjectPrefix}-cache-policy-${Env}
+        DefaultTTL: 3600
+        MinTTL: 0
+        MaxTTL: 86400
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          EnableAcceptEncodingGzip: true
+          HeadersConfig:
+            HeaderBehavior: none
+
+  CloudFrontAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref Route53HostedZoneID
+      Name: !Select [0, !Split [",", !Ref CloudFrontAlias]]
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        # reference: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-route53-aliastarget.html#cfn-route53-aliastarget-hostedzoneid
+        HostedZoneId: Z2FDTNDATAQYW2
+      Type: A
+
+  CloudFrontAliasRecordProdWWW:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateProdResources
+    Properties:
+      HostedZoneId: !Ref Route53HostedZoneID
+      Name: !Select [1, !Split [",", !Ref CloudFrontAlias]]
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        # reference: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-route53-aliastarget.html#cfn-route53-aliastarget-hostedzoneid
+        HostedZoneId: Z2FDTNDATAQYW2
+      Type: A
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - CloudFrontOriginAccessIdentity
+      - CachePolicy
+      - FrontendBucket
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: !Sub ${ProjectPrefix}-s3-bucket-${Env}
+            DomainName: !Join ['', [!Ref FrontendBucket, '.s3.', !Sub '${AWS::Region}.', 'amazonaws.com']]
+            S3OriginConfig:
+              OriginAccessIdentity:
+                !Join ['', ['origin-access-identity/cloudfront/', !Ref CloudFrontOriginAccessIdentity]]
+        Enabled: true
+        Comment: !Sub ${ProjectPrefix} for ${Env}
+        DefaultCacheBehavior:
+          CachePolicyId: !Ref CachePolicy
+          ViewerProtocolPolicy: redirect-to-https
+          TargetOriginId: !Sub ${ProjectPrefix}-s3-bucket-${Env}
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+        DefaultRootObject: index.html
+        Aliases:
+          Fn::Split:
+            - ","
+            - !Ref CloudFrontAlias # CNAME
+        ViewerCertificate:
+          AcmCertificateArn: !Ref ACMCertificateArn
+          SslSupportMethod: sni-only
+        # reference: https://stackoverflow.com/questions/50299204/receive-accessdenied-when-trying-to-access-a-reload-or-refresh-or-one-in-new-tab/50302276#50302276
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 10
+            ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+
+Outputs:
+  BucketName:
+    Description: name of the new S3 bucket
+    Value: !Sub ${ProjectPrefix}-s3-${Env}
+  CloudFrontDNS:
+    Description: CloudFront domain name
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
