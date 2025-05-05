@@ -1,5 +1,3 @@
-# CircleCi config for UI deployment
-
 version: 2.1
 
 executors:
